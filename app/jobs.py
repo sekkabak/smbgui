@@ -27,6 +27,7 @@ class Job:
     message: str = ""
     result: Any = None
     error: Optional[str] = None
+    sid: str = ""  # opaque UI session that owns this job (optional bind)
     created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -49,6 +50,7 @@ class Job:
             "status": self.status,
             "message": self.message,
             "error": self.error,
+            "sid": self.sid,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -95,9 +97,10 @@ class JobManager:
         host: str = "",
         path: str = "",
         bytes_total: int = 0,
+        sid: str = "",
     ) -> Job:
         job_id = progress_hub.new_job(action, host=host, path=path, total=bytes_total)
-        job = Job(job_id=job_id, action=action, host=host, path=path, bytes_total=bytes_total)
+        job = Job(job_id=job_id, action=action, host=host, path=path, bytes_total=bytes_total, sid=sid or "")
         with self._lock:
             self._jobs[job_id] = job
 

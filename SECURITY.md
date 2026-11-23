@@ -9,9 +9,13 @@ policy.
 ## Threat model (honest)
 
 - The HTTP UI historically had **no login of its own**. After connect, the UI uses
-  an **HttpOnly opaque session cookie** (`smbgui_sid`) so passwords / NTLM hashes /
-  AES keys are **not** placed in GET query strings. Credentials still live in
-  **server process memory** for the life of that session.
+  an **HttpOnly opaque session cookie** (`smbgui_sid`, `SameSite=Strict`) so
+  passwords / NTLM hashes / AES keys are **not** placed in GET query strings.
+  Credentials still live in **server process memory** for the life of that session.
+- Cookie-authenticated file downloads (`/api/file`, `/api/zip`) additionally check
+  the browser `Sec-Fetch-Site` header and reject cross-site requests. Residual
+  risk: older browsers / non-browser clients that omit `Sec-Fetch-Site` are not
+  blocked by that check; bind to loopback and treat the cookie as a local secret.
 - There is still **no multi-user authn/authz** on the web UI. Anyone who can reach
   the listening port can drive SMB operations for whatever sessions exist.
 - **Always bind to loopback** (`127.0.0.1`) unless you add your own reverse-proxy

@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import mimetypes
+import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path as FsPath
 from typing import Any, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Cookie, File, Form, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -29,15 +35,29 @@ from .config import settings as reliability_settings, parts_dir
 from .proxy import proxy_from_fields, resolve_proxy
 from .resilience import RetryPolicy
 from .web_sessions import WebSessionStore, store as web_sessions
-from pathlib import Path as FsPath
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-
 from .session_log import SessionLog
 from . import smb_client as smb
 
 PREVIEW_MAX_BYTES = 2 * 1024 * 1024
+# Sync multipart upload soft limit — larger files should use /api/transfer/upload
+SYNC_UPLOAD_MAX_BYTES = int(os.environ.get("SMBGUI_SYNC_UPLOAD_MAX", str(32 * 1024 * 1024)))
 logger = setup_logging()
+
+# Concurrent writers to the same remote path
+_upload_path_locks: dict[str, threading.Lock] = {}
+_upload_path_locks_guard = threading.Lock()
+
+
+def _acquire_upload_path_lock(host: str, share: str, remote: str) -> Optional[threading.Lock]:
+    key = f"{host.lower()}|{share}|{remote}".casefold()
+    with _upload_path_locks_guard:
+        lock = _upload_path_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _upload_path_locks[key] = lock
+    if not lock.acquire(blocking=False):
+        return None
+    return lock
 
 
 def error_response(code: str, message: str, status: int = 400) -> JSONResponse:
@@ -185,6 +205,10 @@ def _sid_from(request: Optional[Request], sid: str = "", cookie_sid: Optional[st
     return ""
 
 
+class SessionAuthError(ValueError):
+    """Opaque sid present but not usable for the requested host."""
+
+
 def _creds_from_fields_or_session(
     *,
     host: str,
@@ -217,14 +241,23 @@ def _creds_from_fields_or_session(
         sess = web_sessions.get_for_host(token, host)
         if sess is not None:
             return sess.creds, sess.port or port, sess.proxy
-        # sid present but miss — fall through; may still have nothing useful
+        # Explicit sid / known cookie must not fall through to empty username.
+        # Host mismatch (multi-host switcher vs stale cookie) is a hard miss.
+        known = web_sessions.get(token)
+        if known is not None or bool(sid):
+            raise SessionAuthError(
+                f"session not valid for host {host!r} (reconnect or pass credentials)"
+            )
     creds = credentials_from_fields(
         username, password, domain, hash, guest, use_kerberos, aes_key, kdc_host, dc_ip, ccache, spn
     )
     return creds, port, None
 
 
-def _creds_from_body_or_session(body, request: Optional[Request] = None, cookie_sid: Optional[str] = None):
+def _creds_from_body_or_session(
+    body, request: Optional[Request] = None, cookie_sid: Optional[str] = None
+) -> tuple[Credentials, Optional[Any]]:
+    """Resolve POST body creds via opaque sid when secrets are omitted. Returns (creds, proxy)."""
     sid = getattr(body, "sid", "") or ""
     host = getattr(body, "host", "") or ""
     has_secrets = bool(
@@ -240,8 +273,40 @@ def _creds_from_body_or_session(body, request: Optional[Request] = None, cookie_
         if sess is not None:
             if not getattr(body, "port", None) or body.port == 445:
                 body.port = sess.port  # type: ignore[attr-defined]
-            return sess.creds
-    return _creds_from_body(body)
+            # Prefer request proxy override; else session-stored proxy
+            body_px = _proxy_from_body(body)
+            return sess.creds, body_px if (body_px and body_px.enabled) else sess.proxy
+        known = web_sessions.get(token)
+        if known is not None or bool(sid):
+            raise SessionAuthError(
+                f"session not valid for host {host!r} (reconnect or pass credentials)"
+            )
+    return _creds_from_body(body), _proxy_from_body(body)
+
+
+def _content_disposition(disposition: str, filename: str) -> str:
+    """RFC 5987-ish Content-Disposition with sanitized filename (no CR/LF/quotes)."""
+    safe = (filename or "download").replace('"', "").replace("\r", "").replace("\n", "").replace("\\", "_")
+    safe = "".join(ch if ord(ch) >= 32 else "_" for ch in safe) or "download"
+    ascii_name = safe.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    return f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(safe, safe='')}"
+
+
+def _reject_cross_site_get(request: Request) -> Optional[JSONResponse]:
+    """
+    Mitigate CSRF / session riding on cookie-authenticated GETs that return file bytes.
+    Browsers send Sec-Fetch-Site on modern navigations; allow same-origin / same-site / none.
+    """
+    site = (request.headers.get("sec-fetch-site") or "").lower()
+    if not site:
+        return None  # non-browser / older clients
+    if site in ("same-origin", "same-site", "none"):
+        return None
+    return error_response(
+        "csrf_blocked",
+        "cross-site request blocked for cookie-authenticated download",
+        status=403,
+    )
 
 
 def _set_sid_cookie(response: Response, sid: str) -> None:
@@ -249,7 +314,7 @@ def _set_sid_cookie(response: Response, sid: str) -> None:
         key=WebSessionStore.COOKIE_NAME,
         value=sid,
         httponly=True,
-        samesite="lax",
+        samesite="strict",
         max_age=12 * 3600,
         path="/",
     )
@@ -388,15 +453,19 @@ def create_router(
         request: Request,
         smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
     ):
-        creds = _creds_from_body_or_session(body, request, smbgui_sid)
         try:
-            session = pool.reconnect(body.host, body.port, creds)
+            creds, proxy = _creds_from_body_or_session(body, request, smbgui_sid)
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
+        proxy = proxy or _proxy_from_body(body)
+        try:
+            session = pool.reconnect(body.host, body.port, creds, proxy=proxy)
             shares = smb.list_shares(session)
         except smb.SMBError as e:
             return error_response(e.code, e.message, status=502)
         ui_sid = _sid_from(request, getattr(body, "sid", ""), smbgui_sid)
         if not ui_sid or web_sessions.get_for_host(ui_sid, body.host) is None:
-            ui_sid = web_sessions.create(body.host, body.port, creds)
+            ui_sid = web_sessions.create(body.host, body.port, creds, proxy=proxy)
         _store_meta(body.host, body.port, creds, session, ui_sid=ui_sid)
         slog.add("reconnect", host=body.host, detail="ok", source="wire", ok=True)
         payload = {
@@ -407,6 +476,33 @@ def create_router(
         }
         resp = JSONResponse(content=payload)
         _set_sid_cookie(resp, ui_sid)
+        return resp
+
+    @router.post("/logout")
+    def logout(
+        body: AuthMixin,
+        request: Request,
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
+        """Revoke opaque UI session and drop pooled SMB connections for the host."""
+        token = _sid_from(request, getattr(body, "sid", "") or "", smbgui_sid)
+        host = (body.host or "").strip()
+        if token:
+            sess = web_sessions.get(token)
+            if sess is not None and (not host or sess.host.lower() == host.lower()):
+                host = host or sess.host
+                pool.disconnect_host(sess.host)
+            web_sessions.revoke(token)
+        elif host:
+            web_sessions.revoke_host(host)
+            pool.disconnect_host(host)
+        else:
+            return error_response("invalid_request", "sid or host required")
+        if host:
+            last_conn.pop(host.lower(), None)
+        slog.add("logout", host=host, detail="revoked", source="local", ok=True)
+        resp = JSONResponse(content={"ok": True, "host": host})
+        resp.delete_cookie(WebSessionStore.COOKIE_NAME, path="/")
         return resp
 
     @router.get("/shares")
@@ -430,24 +526,42 @@ def create_router(
         show_ipc: bool = True,
         smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
     ):
-        creds, port, _px = _creds_from_fields_or_session(
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            domain=domain,
-            hash=hash,
-            guest=guest,
-            use_kerberos=use_kerberos,
-            aes_key=aes_key,
-            kdc_host=kdc_host,
-            dc_ip=dc_ip,
-            ccache=ccache,
-            sid=sid,
-            request=request,
-            cookie_sid=smbgui_sid,
-        )
+        try:
+            creds, port, _px = _creds_from_fields_or_session(
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                domain=domain,
+                hash=hash,
+                guest=guest,
+                use_kerberos=use_kerberos,
+                aes_key=aes_key,
+                kdc_host=kdc_host,
+                dc_ip=dc_ip,
+                ccache=ccache,
+                sid=sid,
+                request=request,
+                cookie_sid=smbgui_sid,
+            )
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
         if use_cache:
+            meta_cached = cache.get(host, "__shares_meta__", "", creds.fingerprint(), allow_stale=True)
+            if meta_cached is not None and meta_cached.entries:
+                try:
+                    import json as _json
+                    shares_out = [_json.loads(x.name) for x in meta_cached.entries]
+                    slog.add("shares", host=host, detail="from cache", source="cache", ok=True)
+                    return {
+                        "host": host,
+                        "shares": shares_out,
+                        "from_cache": True,
+                        "stale": meta_cached.stale,
+                        "fetched_at": meta_cached.fetched_at,
+                    }
+                except Exception:
+                    pass
             cached = cache.get(host, "__shares__", "", creds.fingerprint(), allow_stale=True)
             if cached is not None:
                 slog.add("shares", host=host, detail="from cache", source="cache", ok=True)
@@ -459,12 +573,23 @@ def create_router(
                     "fetched_at": cached.fetched_at,
                 }
         try:
-            session = pool.get(host, port, creds)
+            session = pool.get(host, port, creds, proxy=_px)
             items = smb.list_shares(session, include_hidden=show_hidden, include_ipc=show_ipc)
         except smb.SMBError as e:
             return error_response(e.code, e.message, status=502)
+        import json as _json
         entries = [ListingEntry(name=s.name, size=0, is_dir=True, mtime=0) for s in items]
+        meta_entries = [
+            ListingEntry(
+                name=_json.dumps(smb.share_to_dict(s), separators=(",", ":")),
+                size=0,
+                is_dir=True,
+                mtime=0,
+            )
+            for s in items
+        ]
         listing = cache.put(host, "__shares__", "", creds.fingerprint(), entries)
+        cache.put(host, "__shares_meta__", "", creds.fingerprint(), meta_entries)
         slog.add("shares", host=host, detail=f"wire count={len(items)}", source="wire", ok=True)
         return {
             "host": host,
@@ -495,23 +620,26 @@ def create_router(
         use_cache: bool = True,
         smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
     ):
-        creds, port, _px = _creds_from_fields_or_session(
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            domain=domain,
-            hash=hash,
-            guest=guest,
-            use_kerberos=use_kerberos,
-            aes_key=aes_key,
-            kdc_host=kdc_host,
-            dc_ip=dc_ip,
-            ccache=ccache,
-            sid=sid,
-            request=request,
-            cookie_sid=smbgui_sid,
-        )
+        try:
+            creds, port, _px = _creds_from_fields_or_session(
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                domain=domain,
+                hash=hash,
+                guest=guest,
+                use_kerberos=use_kerberos,
+                aes_key=aes_key,
+                kdc_host=kdc_host,
+                dc_ip=dc_ip,
+                ccache=ccache,
+                sid=sid,
+                request=request,
+                cookie_sid=smbgui_sid,
+            )
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
         try:
             path = normalize_path(path)
         except ValueError as e:
@@ -545,7 +673,7 @@ def create_router(
             )
         activity.set("listing", f"listing {share}/{path}…", host=host, path=f"{share}/{path}", action="list")
         try:
-            session = pool.get(host, port, creds)
+            session = pool.get(host, port, creds, proxy=_px)
             entries = smb.list_directory(session, share, path)
         except smb.SMBError as e:
             slog.add("list", host=host, detail=str(e), source="wire", ok=False, error=e.message)
@@ -567,16 +695,39 @@ def create_router(
         }
 
     @router.post("/refresh")
-    def refresh(body: RefreshBody):
-        creds = _creds_from_body(body)
+    def refresh(
+        body: RefreshBody,
+        request: Request,
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
+        try:
+            creds, proxy = _creds_from_body_or_session(body, request, smbgui_sid)
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
         host = body.host
         if body.all:
             removed = cache.invalidate_host(host)
             try:
-                session = pool.get(host, body.port, creds)
+                session = pool.get(host, body.port, creds, proxy=proxy)
                 items = smb.list_shares(session)
                 entries = [ListingEntry(name=s.name, size=0, is_dir=True, mtime=0) for s in items]
                 listing = cache.put(host, "__shares__", "", creds.fingerprint(), entries)
+                import json as _json
+                cache.put(
+                    host,
+                    "__shares_meta__",
+                    "",
+                    creds.fingerprint(),
+                    [
+                        ListingEntry(
+                            name=_json.dumps(smb.share_to_dict(s), separators=(",", ":")),
+                            size=0,
+                            is_dir=True,
+                            mtime=0,
+                        )
+                        for s in items
+                    ],
+                )
             except smb.SMBError as e:
                 return error_response(e.code, e.message, status=502)
             slog.add("refresh_all", host=host, detail=f"invalidated={removed}", source="wire", ok=True)
@@ -592,13 +743,16 @@ def create_router(
         share = body.share or ""
         if not share:
             return error_response("invalid_request", "share is required unless all=true")
-        path = normalize_path(body.path)
+        try:
+            path = normalize_path(body.path)
+        except ValueError as e:
+            return error_response("invalid_path", str(e))
 
         if body.recursive:
             job_id = progress_hub.new_job("refresh", host=host, path=f"{share}/{path}")
             cache.invalidate_subtree(host, share, path, creds.fingerprint())
             try:
-                session = pool.get(host, body.port, creds)
+                session = pool.get(host, body.port, creds, proxy=proxy)
             except smb.SMBError as e:
                 progress_hub.error(job_id, e.message)
                 return error_response(e.code, e.message, status=502)
@@ -658,7 +812,7 @@ def create_router(
         cache.invalidate(host, share, path, creds.fingerprint())
         activity.set("refreshing", f"refreshing {share}/{path}…", host=host, path=f"{share}/{path}", action="refresh")
         try:
-            session = pool.get(host, body.port, creds)
+            session = pool.get(host, body.port, creds, proxy=proxy)
             entries = smb.list_directory(session, share, path)
         except smb.SMBError as e:
             activity.error(f"refresh failed: {e.message}", host=host)
@@ -700,23 +854,29 @@ def create_router(
         preview: bool = False,
         smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
     ):
-        creds, port, _px = _creds_from_fields_or_session(
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            domain=domain,
-            hash=hash,
-            guest=guest,
-            use_kerberos=use_kerberos,
-            aes_key=aes_key,
-            kdc_host=kdc_host,
-            dc_ip=dc_ip,
-            ccache=ccache,
-            sid=sid,
-            request=request,
-            cookie_sid=smbgui_sid,
-        )
+        blocked = _reject_cross_site_get(request)
+        if blocked is not None:
+            return blocked
+        try:
+            creds, port, _px = _creds_from_fields_or_session(
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                domain=domain,
+                hash=hash,
+                guest=guest,
+                use_kerberos=use_kerberos,
+                aes_key=aes_key,
+                kdc_host=kdc_host,
+                dc_ip=dc_ip,
+                ccache=ccache,
+                sid=sid,
+                request=request,
+                cookie_sid=smbgui_sid,
+            )
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
         try:
             path = normalize_path(path)
         except ValueError as e:
@@ -731,7 +891,7 @@ def create_router(
         ctype = ctype or "application/octet-stream"
 
         try:
-            session = pool.get(host, port, creds)
+            session = pool.get(host, port, creds, proxy=_px)
             if preview:
                 data = smb.download_file(session, share, path, progress=prog)
                 if len(data) > PREVIEW_MAX_BYTES:
@@ -747,7 +907,7 @@ def create_router(
                     headers={
                         "X-Preview": "1",
                         "X-Job-Id": job_id,
-                        "Content-Disposition": f'inline; filename="{name}"',
+                        "Content-Disposition": _content_disposition("inline", name),
                     },
                 )
 
@@ -765,7 +925,10 @@ def create_router(
             return StreamingResponse(
                 gen(),
                 media_type=ctype,
-                headers={"Content-Disposition": f'attachment; filename="{name}"', "X-Job-Id": job_id},
+                headers={
+                    "Content-Disposition": _content_disposition("attachment", name),
+                    "X-Job-Id": job_id,
+                },
             )
         except smb.SMBError as e:
             progress_hub.error(job_id, e.message)
@@ -791,23 +954,29 @@ def create_router(
         sid: str = "",
         smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
     ):
-        creds, port, _px = _creds_from_fields_or_session(
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            domain=domain,
-            hash=hash,
-            guest=guest,
-            use_kerberos=use_kerberos,
-            aes_key=aes_key,
-            kdc_host=kdc_host,
-            dc_ip=dc_ip,
-            ccache=ccache,
-            sid=sid,
-            request=request,
-            cookie_sid=smbgui_sid,
-        )
+        blocked = _reject_cross_site_get(request)
+        if blocked is not None:
+            return blocked
+        try:
+            creds, port, _px = _creds_from_fields_or_session(
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                domain=domain,
+                hash=hash,
+                guest=guest,
+                use_kerberos=use_kerberos,
+                aes_key=aes_key,
+                kdc_host=kdc_host,
+                dc_ip=dc_ip,
+                ccache=ccache,
+                sid=sid,
+                request=request,
+                cookie_sid=smbgui_sid,
+            )
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
         try:
             path = normalize_path(path)
         except ValueError as e:
@@ -818,7 +987,7 @@ def create_router(
             progress_hub.update(job_id, bytes_done=done, message=f"files={done}")
 
         try:
-            session = pool.get(host, port, creds)
+            session = pool.get(host, port, creds, proxy=_px)
             data = smb.zip_folder(session, share, path, progress=prog)
         except smb.SMBError as e:
             progress_hub.error(job_id, e.message)
@@ -829,11 +998,15 @@ def create_router(
         return Response(
             content=data,
             media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{name}"', "X-Job-Id": job_id},
+            headers={
+                "Content-Disposition": _content_disposition("attachment", name),
+                "X-Job-Id": job_id,
+            },
         )
 
     @router.post("/upload")
     async def upload(
+        request: Request,
         host: str = Form(...),
         share: str = Form(...),
         path: str = Form(""),
@@ -848,22 +1021,58 @@ def create_router(
         kdc_host: str = Form(""),
         dc_ip: str = Form(""),
         ccache: str = Form(""),
+        sid: str = Form(""),
         job_id: Optional[str] = Form(None),
         file: UploadFile = File(...),
         smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
     ):
-        creds, port, _px = _creds_from_fields_or_session(
-            host=host, port=port, username=username, password=password, domain=domain,
-            hash=hash, guest=guest, use_kerberos=use_kerberos, aes_key=aes_key,
-            kdc_host=kdc_host, dc_ip=dc_ip, ccache=ccache, cookie_sid=smbgui_sid,
-        )
+        try:
+            creds, port, _px = _creds_from_fields_or_session(
+                host=host, port=port, username=username, password=password, domain=domain,
+                hash=hash, guest=guest, use_kerberos=use_kerberos, aes_key=aes_key,
+                kdc_host=kdc_host, dc_ip=dc_ip, ccache=ccache, sid=sid,
+                request=request, cookie_sid=smbgui_sid,
+            )
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
         try:
             dest_dir = normalize_path(path)
         except ValueError as e:
             return error_response("invalid_path", str(e))
         filename = file.filename or "upload.bin"
         dest = f"{dest_dir}/{filename}" if dest_dir else filename
-        data = await file.read()
+        # Stream to staging; reject oversized sync uploads (use /api/transfer/upload)
+        import uuid
+        staging = parts_dir() / f"sync_upload_{uuid.uuid4().hex}_{filename}".replace("/", "_").replace("\\", "_")
+        size_read = 0
+        try:
+            with open(staging, "wb") as fh:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size_read += len(chunk)
+                    if size_read > SYNC_UPLOAD_MAX_BYTES:
+                        fh.close()
+                        try:
+                            staging.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return error_response(
+                            "too_large",
+                            f"sync upload exceeds {SYNC_UPLOAD_MAX_BYTES} bytes; use /api/transfer/upload",
+                            413,
+                        )
+                    fh.write(chunk)
+            data = staging.read_bytes()
+        finally:
+            try:
+                staging.unlink(missing_ok=True)
+            except Exception:
+                pass
+        path_lock = _acquire_upload_path_lock(host, share, dest)
+        if path_lock is None:
+            return error_response("conflict", f"upload already in progress for {share}/{dest}", 409)
         jid = job_id or progress_hub.new_job("upload", host=host, path=f"{share}/{dest}", total=len(data))
         progress_hub.update(jid, bytes_total=len(data))
 
@@ -871,12 +1080,14 @@ def create_router(
             progress_hub.update(jid, bytes_done=done, bytes_total=total)
 
         try:
-            session = pool.get(host, port, creds)
+            session = pool.get(host, port, creds, proxy=_px)
             size = smb.upload_file(session, share, dest, data, progress=prog)
         except smb.SMBError as e:
             progress_hub.error(jid, e.message)
             slog.add("upload", host=host, detail=str(e), source="wire", ok=False, error=e.message)
             return error_response(e.code, e.message, status=502)
+        finally:
+            path_lock.release()
 
         cache.invalidate(host, share, dest_dir, creds.fingerprint())
         try:
@@ -889,28 +1100,49 @@ def create_router(
         return {"ok": True, "path": dest, "size": size, "job_id": jid}
 
     @router.post("/mkdir")
-    def api_mkdir(body: PathBody):
-        creds = _creds_from_body(body)
-        path = normalize_path(body.path)
+    def api_mkdir(
+        body: PathBody,
+        request: Request,
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
+        try:
+            creds, proxy = _creds_from_body_or_session(body, request, smbgui_sid)
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
+        try:
+            path = normalize_path(body.path)
+        except ValueError as e:
+            return error_response("invalid_path", str(e))
         if not path:
             return error_response("invalid_request", "path is required")
         try:
-            session = pool.get(body.host, body.port, creds)
+            session = pool.get(body.host, body.port, creds, proxy=proxy)
             smb.mkdir(session, body.share, path)
         except smb.SMBError as e:
             return error_response(e.code, e.message, status=502)
-        cache.invalidate(body.host, body.share, path, creds.fingerprint())
+        parent = "/".join(path.split("/")[:-1])
+        cache.invalidate(body.host, body.share, parent, creds.fingerprint())
         slog.add("mkdir", host=body.host, detail=f"{body.share}/{path}", source="wire", ok=True)
         return {"ok": True, "path": path}
 
     @router.post("/delete")
-    def api_delete(body: DeleteBody):
-        creds = _creds_from_body(body)
-        path = normalize_path(body.path)
+    def api_delete(
+        body: DeleteBody,
+        request: Request,
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
+        try:
+            creds, proxy = _creds_from_body_or_session(body, request, smbgui_sid)
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
+        try:
+            path = normalize_path(body.path)
+        except ValueError as e:
+            return error_response("invalid_path", str(e))
         if not path:
             return error_response("invalid_request", "path is required")
         try:
-            session = pool.get(body.host, body.port, creds)
+            session = pool.get(body.host, body.port, creds, proxy=proxy)
             if body.recursive and body.is_dir:
                 n = smb.delete_tree(session, body.share, path)
             else:
@@ -923,14 +1155,24 @@ def create_router(
         return {"ok": True, "path": path, "deleted": n}
 
     @router.post("/rename")
-    def api_rename(body: RenameBody):
-        creds = _creds_from_body(body)
-        old_path = normalize_path(body.path)
-        new_path = normalize_path(body.new_path)
+    def api_rename(
+        body: RenameBody,
+        request: Request,
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
+        try:
+            creds, proxy = _creds_from_body_or_session(body, request, smbgui_sid)
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
+        try:
+            old_path = normalize_path(body.path)
+            new_path = normalize_path(body.new_path)
+        except ValueError as e:
+            return error_response("invalid_path", str(e))
         if not old_path or not new_path:
             return error_response("invalid_request", "path and new_path are required")
         try:
-            session = pool.get(body.host, body.port, creds)
+            session = pool.get(body.host, body.port, creds, proxy=proxy)
             smb.rename(session, body.share, old_path, new_path)
         except smb.SMBError as e:
             return error_response(e.code, e.message, status=502)
@@ -940,10 +1182,17 @@ def create_router(
         return {"ok": True, "path": old_path, "new_path": new_path}
 
     @router.post("/copy")
-    def api_copy(body: CopyMoveBody):
-        creds = _creds_from_body(body)
+    def api_copy(
+        body: CopyMoveBody,
+        request: Request,
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
         try:
-            session = pool.get(body.host, body.port, creds)
+            creds, proxy = _creds_from_body_or_session(body, request, smbgui_sid)
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
+        try:
+            session = pool.get(body.host, body.port, creds, proxy=proxy)
             if body.action == "move":
                 smb.move_file(session, body.src_share, body.src_path, body.dst_share, body.dst_path)
             else:
@@ -962,10 +1211,17 @@ def create_router(
         return {"ok": True, "action": body.action}
 
     @router.post("/bulk")
-    def api_bulk(body: BulkBody):
-        creds = _creds_from_body(body)
+    def api_bulk(
+        body: BulkBody,
+        request: Request,
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
         try:
-            session = pool.get(body.host, body.port, creds)
+            creds, proxy = _creds_from_body_or_session(body, request, smbgui_sid)
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
+        try:
+            session = pool.get(body.host, body.port, creds, proxy=proxy)
         except smb.SMBError as e:
             return error_response(e.code, e.message, status=502)
         results = []
@@ -1002,7 +1258,7 @@ def create_router(
             return Response(
                 content=buf.getvalue(),
                 media_type="application/zip",
-                headers={"Content-Disposition": 'attachment; filename="selection.zip"'},
+                headers={"Content-Disposition": _content_disposition("attachment", "selection.zip")},
             )
         return error_response("invalid_request", f"unknown bulk action {body.action}")
 
@@ -1026,18 +1282,21 @@ def create_router(
         sid: str = "",
         smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
     ):
-        creds, port, _px = _creds_from_fields_or_session(
-            host=host, port=port, username=username, password=password, domain=domain,
-            hash=hash, guest=guest, use_kerberos=use_kerberos, aes_key=aes_key,
-            kdc_host=kdc_host, dc_ip=dc_ip, ccache=ccache, sid=sid,
-            request=request, cookie_sid=smbgui_sid,
-        )
+        try:
+            creds, port, _px = _creds_from_fields_or_session(
+                host=host, port=port, username=username, password=password, domain=domain,
+                hash=hash, guest=guest, use_kerberos=use_kerberos, aes_key=aes_key,
+                kdc_host=kdc_host, dc_ip=dc_ip, ccache=ccache, sid=sid,
+                request=request, cookie_sid=smbgui_sid,
+            )
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
         try:
             path = normalize_path(path)
         except ValueError as e:
             return error_response("invalid_path", str(e))
         try:
-            session = pool.get(host, port, creds)
+            session = pool.get(host, port, creds, proxy=_px)
             props = smb.get_properties(session, share, path)
         except smb.SMBError as e:
             return error_response(e.code, e.message, status=502)
@@ -1063,12 +1322,15 @@ def create_router(
         limit: int = 200,
         smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
     ):
-        creds, _port, _px = _creds_from_fields_or_session(
-            host=host, username=username, password=password, domain=domain,
-            hash=hash, guest=guest, use_kerberos=use_kerberos, aes_key=aes_key,
-            kdc_host=kdc_host, dc_ip=dc_ip, ccache=ccache, sid=sid,
-            request=request, cookie_sid=smbgui_sid,
-        )
+        try:
+            creds, _port, _px = _creds_from_fields_or_session(
+                host=host, username=username, password=password, domain=domain,
+                hash=hash, guest=guest, use_kerberos=use_kerberos, aes_key=aes_key,
+                kdc_host=kdc_host, dc_ip=dc_ip, ccache=ccache, sid=sid,
+                request=request, cookie_sid=smbgui_sid,
+            )
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
         hits = cache.search(host, q, cred_fp=creds.fingerprint(), share=share, limit=limit, use_fts=True)
         slog.add("search", host=host, detail=f"q={q!r} hits={len(hits)}", source="cache", ok=True)
         return {"host": host, "query": q, "hits": hits, "from_cache": True, "engine": "fts"}
@@ -1107,16 +1369,33 @@ def create_router(
         }
 
     @router.get("/cache/export")
-    def cache_export(host: str = Query(...)):
+    def cache_export(
+        request: Request,
+        host: str = Query(...),
+        sid: str = "",
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
+        token = _sid_from(request, sid, smbgui_sid)
+        if token and web_sessions.get_for_host(token, host) is None and web_sessions.get(token) is not None:
+            return error_response("session_auth", "session not valid for host", 401)
         data = cache.export_host(host)
         return Response(
             content=data,
             media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="cache_{host}.zip"'},
+            headers={"Content-Disposition": _content_disposition("attachment", f"cache_{host}.zip")},
         )
 
     @router.post("/cache/import")
-    async def cache_import(host: str = Form(...), file: UploadFile = File(...)):
+    async def cache_import(
+        request: Request,
+        host: str = Form(...),
+        sid: str = Form(""),
+        file: UploadFile = File(...),
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
+        token = _sid_from(request, sid, smbgui_sid)
+        if token and web_sessions.get_for_host(token, host) is None and web_sessions.get(token) is not None:
+            return error_response("session_auth", "session not valid for host", 401)
         data = await file.read()
         try:
             info = cache.import_host(host, data)
@@ -1125,7 +1404,14 @@ def create_router(
         return {"ok": True, **info}
 
     @router.get("/log")
-    def get_log(limit: int = 200):
+    def get_log(
+        request: Request,
+        limit: int = 200,
+        sid: str = "",
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
+        # Soft bind: when a session cookie is present, still return log (local-only tool).
+        _ = _sid_from(request, sid, smbgui_sid)
         return {"entries": slog.list(limit=limit)}
 
     @router.get("/session")
@@ -1133,7 +1419,12 @@ def create_router(
         meta = last_conn.get(host.lower())
         if not meta:
             return error_response("not_found", "no session meta for host", status=404)
-        safe = {k: v for k, v in meta.items() if k not in ("password", "hash", "aes_key")}
+        # Omit raw sid — cookie is the transport; sid in JSON is unnecessary for cookie clients
+        safe = {
+            k: v
+            for k, v in meta.items()
+            if k not in ("password", "hash", "aes_key", "sid")
+        }
         return safe
 
 
@@ -1170,12 +1461,15 @@ def create_router(
         if not is_browsable_share(share):
             return error_response("not_browsable", f"{share} is not exportable", 400)
 
-        creds, port, _px = _creds_from_fields_or_session(
-            host=host, port=port, username=username, password=password, domain=domain,
-            hash=hash, guest=guest, use_kerberos=use_kerberos, aes_key=aes_key,
-            kdc_host=kdc_host, dc_ip=dc_ip, ccache=ccache, sid=sid,
-            request=request, cookie_sid=smbgui_sid,
-        )
+        try:
+            creds, port, _px = _creds_from_fields_or_session(
+                host=host, port=port, username=username, password=password, domain=domain,
+                hash=hash, guest=guest, use_kerberos=use_kerberos, aes_key=aes_key,
+                kdc_host=kdc_host, dc_ip=dc_ip, ccache=ccache, sid=sid,
+                request=request, cookie_sid=smbgui_sid,
+            )
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
         try:
             path = normalize_path(path)
         except ValueError as e:
@@ -1187,7 +1481,7 @@ def create_router(
                 cached = cache.get(host, share, dirpath, creds.fingerprint(), allow_stale=True)
                 if cached is not None:
                     return cached.entries, True
-            session = pool.get(host, port, creds)
+            session = pool.get(host, port, creds, proxy=_px)
             entries = smb.list_directory(session, share, dirpath)
             cache.put(host, share, dirpath, creds.fingerprint(), entries)
             return entries, False
@@ -1198,7 +1492,7 @@ def create_router(
                 rows = rows_from_listing(share, path, entries)
             else:
                 # Prefer walking via SMB with same caps; use cache when available for each dir
-                session = pool.get(host, port, creds)
+                session = pool.get(host, port, creds, proxy=_px)
                 dirs_done = 0
                 for dirpath, entries in smb.walk_directories(
                     session, share, path, max_depth=max_depth, max_dirs=max_dirs
@@ -1228,7 +1522,7 @@ def create_router(
             content=body.encode("utf-8"),
             media_type=media,
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Disposition": _content_disposition("attachment", filename),
                 "X-Row-Count": str(len(rows)),
             },
         )
@@ -1267,16 +1561,48 @@ def create_router(
         slog.add("reliability", detail=str(reliability_settings.to_dict()), source="local", ok=True)
         return {"ok": True, "reliability": reliability_settings.to_dict(), "ttl": cache.default_ttl}
 
+    def _job_sid_ok(job, request: Request, sid: str = "", cookie_sid: Optional[str] = None) -> bool:
+        """Allow job access when unbound (legacy) or sid matches."""
+        token = _sid_from(request, sid, cookie_sid)
+        job_sid = getattr(job, "sid", "") or ""
+        if not job_sid:
+            return True
+        if not token:
+            return False
+        return token == job_sid
+
     @router.get("/jobs")
-    def list_jobs(limit: int = 50):
-        return {"jobs": job_manager.list(limit=limit)}
+    def list_jobs(
+        request: Request,
+        limit: int = 50,
+        sid: str = "",
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
+        token = _sid_from(request, sid, smbgui_sid)
+        jobs = job_manager.list(limit=limit * 2 if token else limit)
+        if token:
+            jobs = [j for j in jobs if not j.get("sid") or j.get("sid") == token][:limit]
+        else:
+            jobs = jobs[:limit]
+        # Do not echo sid in list payloads
+        for j in jobs:
+            j.pop("sid", None)
+        return {"jobs": jobs}
 
     @router.get("/jobs/{job_id}")
-    def get_job(job_id: str):
+    def get_job(
+        job_id: str,
+        request: Request,
+        sid: str = "",
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
         job = job_manager.get(job_id)
         if not job:
             return error_response("not_found", "job not found", 404)
+        if not _job_sid_ok(job, request, sid, smbgui_sid):
+            return error_response("forbidden", "job not visible for this session", 403)
         info = job.to_dict()
+        info.pop("sid", None)
         # For completed download jobs, expose a fetch URL hint
         if job.status == "done" and isinstance(job.result, dict):
             info["result"] = {k: v for k, v in job.result.items() if k != "data"}
@@ -1285,7 +1611,17 @@ def create_router(
         return info
 
     @router.post("/jobs/{job_id}/cancel")
-    def cancel_job(job_id: str):
+    def cancel_job(
+        job_id: str,
+        request: Request,
+        sid: str = "",
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
+        job = job_manager.get(job_id)
+        if not job:
+            return error_response("not_found", "job not found", 404)
+        if not _job_sid_ok(job, request, sid, smbgui_sid):
+            return error_response("forbidden", "job not visible for this session", 403)
         if not job_manager.cancel(job_id):
             return error_response("not_found", "job not found", 404)
         slog.add("job_cancel", detail=job_id, source="local", ok=True)
@@ -1293,10 +1629,17 @@ def create_router(
         return {"ok": True, "job_id": job_id}
 
     @router.get("/jobs/{job_id}/result")
-    def job_result(job_id: str):
+    def job_result(
+        job_id: str,
+        request: Request,
+        sid: str = "",
+        smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
+    ):
         job = job_manager.get(job_id)
         if not job or job.status != "done":
             return error_response("not_ready", "job not done or missing", 404)
+        if not _job_sid_ok(job, request, sid, smbgui_sid):
+            return error_response("forbidden", "job not visible for this session", 403)
         result = job.result or {}
         if isinstance(result, dict) and result.get("local_path"):
             path = FsPath(result["local_path"])
@@ -1315,7 +1658,7 @@ def create_router(
             return StreamingResponse(
                 file_iter(path),
                 media_type="application/octet-stream",
-                headers={"Content-Disposition": f'attachment; filename="{name}"'},
+                headers={"Content-Disposition": _content_disposition("attachment", name)},
             )
         if isinstance(result, (bytes, bytearray)):
             return Response(content=bytes(result), media_type="application/octet-stream")
@@ -1324,8 +1667,12 @@ def create_router(
     @router.post("/transfer/download")
     def start_download_job(body: PathBody, request: Request, smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME)):
         """Start a background resumable download (hours-safe; poll /api/jobs/{id})."""
-        creds = _creds_from_body_or_session(body, request, smbgui_sid)
-        proxy = _proxy_from_body(body)
+        try:
+            creds, proxy = _creds_from_body_or_session(body, request, smbgui_sid)
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
+        proxy = proxy or _proxy_from_body(body)
+        ui_sid = _sid_from(request, getattr(body, "sid", "") or "", smbgui_sid)
         try:
             path = normalize_path(body.path)
         except ValueError as e:
@@ -1380,11 +1727,14 @@ def create_router(
             activity.idle(f"download done: {filename}")
             return {"local_path": str(local), "filename": filename}
 
-        job = job_manager.submit("download", work, host=body.host, path=f"{body.share}/{path}")
+        job = job_manager.submit(
+            "download", work, host=body.host, path=f"{body.share}/{path}", sid=ui_sid
+        )
         return {"ok": True, "job_id": job.job_id, "status": job.status}
 
     @router.post("/transfer/upload")
     async def start_upload_job(
+        request: Request,
         host: str = Form(...),
         share: str = Form(...),
         path: str = Form(""),
@@ -1394,6 +1744,7 @@ def create_router(
         domain: str = Form(""),
         hash: Optional[str] = Form(None),
         guest: bool = Form(False),
+        sid: str = Form(""),
         proxy_type: str = Form(""),
         proxy_host: str = Form(""),
         proxy_port: int = Form(0),
@@ -1404,87 +1755,100 @@ def create_router(
         smbgui_sid: Optional[str] = Cookie(None, alias=WebSessionStore.COOKIE_NAME),
     ):
         """Accept file to disk then background resumable upload (hours-safe)."""
-        from .auth import credentials_from_fields as cff
-        # Prefer cookie/session when form omits secrets
-        token = smbgui_sid or ""
-        if token and not (password or hash or username or guest):
-            sess = web_sessions.get_for_host(token, host)
-            if sess is not None:
-                creds = sess.creds
-                port = sess.port or port
-            else:
-                creds = cff(username, password, domain, hash, guest)
-        else:
-            creds = cff(username, password, domain, hash, guest)
-        proxy = proxy_from_fields(proxy_type, proxy_host, proxy_port, proxy_user, proxy_pass) if proxy_host else None
+        try:
+            creds, port, sess_proxy = _creds_from_fields_or_session(
+                host=host, port=port, username=username, password=password, domain=domain,
+                hash=hash, guest=guest, sid=sid, request=request, cookie_sid=smbgui_sid,
+            )
+        except SessionAuthError as e:
+            return error_response("session_auth", str(e), status=401)
+        body_proxy = (
+            proxy_from_fields(proxy_type, proxy_host, proxy_port, proxy_user, proxy_pass)
+            if proxy_host
+            else None
+        )
+        proxy = body_proxy if (body_proxy and body_proxy.enabled) else sess_proxy
+        ui_sid = _sid_from(request, sid, smbgui_sid)
         try:
             dest_dir = normalize_path(path)
         except ValueError as e:
             return error_response("invalid_path", str(e))
         filename = file.filename or "upload.bin"
         remote = f"{dest_dir}/{filename}" if dest_dir else filename
+        path_lock = _acquire_upload_path_lock(host, share, remote)
+        if path_lock is None:
+            return error_response("conflict", f"upload already in progress for {share}/{remote}", 409)
         # Stream upload body to a unique temp path (avoid part-name collisions)
         import uuid
         staging = parts_dir() / f"upload_staging_{uuid.uuid4().hex}_{filename}".replace("/", "_").replace("\\", "_")
         size = 0
-        with open(staging, "wb") as fh:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                size += len(chunk)
+        try:
+            with open(staging, "wb") as fh:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    size += len(chunk)
+        except Exception:
+            path_lock.release()
+            raise
 
         def work(job):
-            local = parts_dir() / f"{job.job_id}_upload_{host}_{filename}".replace("/", "_").replace("\\", "_")
             try:
-                staging.replace(local)
-            except Exception:
-                local = staging
-            job.bytes_total = size
-            activity.set("uploading", f"uploading {filename}…", host=host, path=f"{share}/{remote}", action="upload")
-            def on_retry(n, e, d):
-                # On retry, let upload_resumable query remote EOF (remote_offset=0 + query_remote)
-                job_manager.update_progress(job, job.bytes_done, size, message=f"retry {n} waiting {d:.1f}s")
-                activity.set(
-                    "retrying",
-                    f"retry {n}/{reliability_settings.max_retries} ({e}) — backing off {d:.0f}s",
-                    severity="warn",
-                    host=host,
-                    path=f"{share}/{remote}",
-                    action="upload",
-                )
-
-            def do(session):
-                def prog(done, total):
-                    job_manager.update_progress(job, done, total, message="uploading")
-                    pct = round(100.0 * done / total, 1) if total else None
+                local = parts_dir() / f"{job.job_id}_upload_{host}_{filename}".replace("/", "_").replace("\\", "_")
+                try:
+                    staging.replace(local)
+                except Exception:
+                    local = staging
+                job.bytes_total = size
+                activity.set("uploading", f"uploading {filename}…", host=host, path=f"{share}/{remote}", action="upload")
+                def on_retry(n, e, d):
+                    # On retry, let upload_resumable query remote EOF (remote_offset=0 + query_remote)
+                    job_manager.update_progress(job, job.bytes_done, size, message=f"retry {n} waiting {d:.1f}s")
                     activity.set(
-                        "uploading",
-                        f"uploading {filename}" + (f" {pct}%" if pct is not None else ""),
+                        "retrying",
+                        f"retry {n}/{reliability_settings.max_retries} ({e}) — backing off {d:.0f}s",
+                        severity="warn",
                         host=host,
                         path=f"{share}/{remote}",
                         action="upload",
-                        progress=pct,
                     )
-                # First attempt may use client resume_offset; retries query remote EOF
-                offset = int(resume_offset or 0)
-                if job.bytes_done and job.bytes_done > 0:
-                    offset = 0  # force remote query after partial progress / reconnect
-                return smb.upload_resumable(
-                    session, share, remote, local,
-                    progress=prog,
-                    cancel_check=job.cancel_event.is_set,
-                    remote_offset=offset,
-                    query_remote=True,
-                )
 
-            n = pool.run(host, port, creds, do, operation=f"upload:{remote}", proxy=proxy, on_retry=on_retry)
-            cache.invalidate(host, share, dest_dir, creds.fingerprint())
-            activity.idle(f"upload done: {filename}")
-            return {"remote_path": remote, "size": n, "local_path": str(local)}
+                def do(session):
+                    def prog(done, total):
+                        job_manager.update_progress(job, done, total, message="uploading")
+                        pct = round(100.0 * done / total, 1) if total else None
+                        activity.set(
+                            "uploading",
+                            f"uploading {filename}" + (f" {pct}%" if pct is not None else ""),
+                            host=host,
+                            path=f"{share}/{remote}",
+                            action="upload",
+                            progress=pct,
+                        )
+                    # First attempt may use client resume_offset; retries query remote EOF
+                    offset = int(resume_offset or 0)
+                    if job.bytes_done and job.bytes_done > 0:
+                        offset = 0  # force remote query after partial progress / reconnect
+                    return smb.upload_resumable(
+                        session, share, remote, local,
+                        progress=prog,
+                        cancel_check=job.cancel_event.is_set,
+                        remote_offset=offset,
+                        query_remote=True,
+                    )
 
-        job = job_manager.submit("upload", work, host=host, path=f"{share}/{remote}", bytes_total=size)
+                n = pool.run(host, port, creds, do, operation=f"upload:{remote}", proxy=proxy, on_retry=on_retry)
+                cache.invalidate(host, share, dest_dir, creds.fingerprint())
+                activity.idle(f"upload done: {filename}")
+                return {"remote_path": remote, "size": n, "local_path": str(local)}
+            finally:
+                path_lock.release()
+
+        job = job_manager.submit(
+            "upload", work, host=host, path=f"{share}/{remote}", bytes_total=size, sid=ui_sid
+        )
         return {"ok": True, "job_id": job.job_id, "status": job.status, "size": size}
 
     # --- bookmarks ---
@@ -1576,7 +1940,3 @@ def create_ws_router() -> APIRouter:
             progress_hub.unsubscribe(q, job_id)
 
     return router
-
-
-# late import for asyncio used in ws
-import asyncio  # noqa: E402

@@ -27,13 +27,25 @@ const state = {
 
 let ws = null;
 
-/** GET query params — never put passwords/hashes/aes keys in the URL. */
+/** GET query params — never put passwords/hashes/aes keys in the URL.
+ *  Prefer the HttpOnly cookie; only add sid when cookie may be wrong host
+ *  (multi-host switcher) — still avoid putting sid on every navigation. */
 function authParams() {
   const p = new URLSearchParams();
   p.set("port", String(state.port || 445));
-  if (state.sid) p.set("sid", state.sid);
-  // Cookie smbgui_sid is sent automatically with credentials: 'include'
+  // Cookie smbgui_sid is sent automatically with credentials: 'include'.
+  // Include sid only for host-switch mismatch safety (same value as cookie after connect).
+  if (state.sid && state._sidInQuery) p.set("sid", state.sid);
   return p;
+}
+
+function escapeAttr(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 /** POST JSON body — prefer sid after connect; include secrets only when needed. */
@@ -421,11 +433,35 @@ function switchSession() {
     aes_key: s.aes_key || "", kdc_host: s.kdc_host || "", dc_ip: s.dc_ip || "", ccache: s.ccache || "",
     cred_fp: s.cred_fp, session_id: s.session_id, sid: s.sid || null, share: null, path: "", selected: [],
   });
-  // reload shares
-  api(`/api/shares?${authParams().toString()}&host=${encodeURIComponent(state.host)}`).then((data) => {
+  // Cookie may still be for another host — put sid in query for this fetch
+  state._sidInQuery = true;
+  const p = authParams();
+  p.set("host", state.host);
+  p.set("sid", state.sid || "");
+  api(`/api/shares?${p.toString()}`).then((data) => {
     renderShares(data.shares || []);
     if (data.shares?.[0]) { state.share = data.shares[0].name; listPath(""); }
   }).catch((e) => setStatus(e.message));
+}
+
+async function disconnectSession() {
+  if (!state.host && !state.sid) return;
+  try {
+    await api("/api/logout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ host: state.host || "", ...authBody() }),
+    });
+  } catch (e) {
+    setStatus("logout failed: " + e.message);
+    return;
+  }
+  if (state.session_id) delete state.sessions[state.session_id];
+  state.host = null; state.share = null; state.path = ""; state.sid = null; state.session_id = null;
+  state.selected = []; state.entries = [];
+  renderHostSwitcher();
+  renderShares([]);
+  setStatus("disconnected");
 }
 
 async function listPath(path, useCache = true) {
@@ -539,7 +575,8 @@ async function uploadFiles(fileList) {
     fd.append("share", state.share);
     fd.append("path", state.path || "");
     fd.append("port", String(state.port || 445));
-    // Prefer opaque session cookie — avoid putting secrets in multipart when sid is set
+    // Always send sid in FormData so host switcher + stale cookie cannot resolve empty creds
+    if (state.sid) fd.append("sid", state.sid);
     if (!state.sid) {
       fd.append("username", state.username || "");
       fd.append("password", state.password || "");
@@ -650,7 +687,7 @@ async function doSearch() {
   el.classList.remove("hidden");
   el.innerHTML = `<div class="meta">${data.hits.length} FTS hit(s)</div>` + data.hits.map((h) => {
     const full = h.fullpath || `${h.share}/${h.path}/${h.name}`;
-    return `<div class="tree-item" data-share="${h.share}" data-path="${h.path}" data-name="${escapeHtml(h.name)}" data-dir="${h.is_dir?1:0}">${escapeHtml(full)}</div>`;
+    return `<div class="tree-item" data-share="${escapeAttr(h.share || "")}" data-path="${escapeAttr(h.path || "")}" data-name="${escapeAttr(h.name || "")}" data-dir="${h.is_dir?1:0}">${escapeHtml(full)}</div>`;
   }).join("");
   el.querySelectorAll(".tree-item").forEach((node) => {
     node.onclick = () => {
@@ -687,6 +724,7 @@ async function cacheStatus() {
 // events
 document.getElementById("connForm").addEventListener("submit", connect);
 document.getElementById("btnKerbMore").onclick = () => document.getElementById("kerbPanel").classList.toggle("hidden");
+document.getElementById("btnDisconnect").onclick = () => disconnectSession().catch((e) => setStatus(e.message));
 document.getElementById("hostSwitcher").onchange = switchSession;
 document.getElementById("btnRefresh").onclick = () => doRefresh({});
 document.getElementById("btnRefreshRec").onclick = () => doRefresh({ recursive: true });
