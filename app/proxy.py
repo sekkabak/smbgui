@@ -43,10 +43,11 @@ _ENV_KEYS = (
     "http_proxy",
 )
 
-# Serialize process-wide socket.socket monkeypatch — Impacket creates its own
-# sockets internally, so we cannot pass a per-connection sock without deeper
-# hooks. A lock prevents concurrent connect paths from racing the global replace.
-_proxy_socket_lock = threading.RLock()
+# Thread-local: only opted-in SMB connect paths create proxied sockets.
+_tls = threading.local()
+_orig_socket = socket.socket
+_patch_lock = threading.Lock()
+_patched = False
 
 
 def parse_proxy_url(url: str) -> ProxyConfig:
@@ -127,52 +128,81 @@ def resolve_proxy(
     return ProxyConfig(enabled=False)
 
 
+class _ThreadLocalSocket(_orig_socket):
+    """
+    ``socket.socket`` stand-in. Remains a real type (isinstance-safe for httpx).
+
+    When this thread has opted into a proxy via ``proxy_socket_context``,
+    ``__new__`` returns a configured ``socks.socksocket`` instead. Other threads
+    keep getting plain sockets — no process-wide contamination during yield.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        proxy = getattr(_tls, "proxy", None)
+        if proxy is not None and getattr(proxy, "enabled", False) and proxy.host:
+            import socks
+
+            type_map = {
+                "socks5": socks.SOCKS5,
+                "socks4": socks.SOCKS4,
+                "http": socks.HTTP,
+            }
+            if proxy.proxy_type not in type_map:
+                raise ValueError(f"unsupported proxy_type: {proxy.proxy_type}")
+            sock = socks.socksocket(*args, **kwargs)
+            sock.set_proxy(
+                type_map[proxy.proxy_type],
+                proxy.host,
+                int(proxy.port),
+                True,
+                proxy.username or None,
+                proxy.password or None,
+            )
+            return sock
+        return _orig_socket.__new__(cls, *args, **kwargs)
+
+    def __init__(self, *args, **kwargs):
+        # Only invoked when __new__ returned a _ThreadLocalSocket (non-proxy path).
+        _orig_socket.__init__(self, *args, **kwargs)
+
+
+def _ensure_thread_local_socket_patch() -> None:
+    global _patched
+    with _patch_lock:
+        if _patched:
+            return
+        socket.socket = _ThreadLocalSocket  # type: ignore[misc,assignment]
+        _patched = True
+
+
 @contextmanager
 def proxy_socket_context(proxy: ProxyConfig) -> Iterator[None]:
     """
     Route new TCP sockets through the configured proxy via PySocks for the
-    duration of the with-block.
+    duration of the with-block **on this thread only**.
 
-    Impacket constructs sockets internally, so this uses a temporary
-    ``socket.socket = socks.socksocket`` swap. The swap is held under a
-    process-wide lock so concurrent SMB connects cannot race each other.
-    Prefer ``create_proxied_connection`` when you control the socket yourself.
+    Impacket constructs sockets internally. A thread-local-aware ``socket.socket``
+    subclass is installed once process-wide; only threads inside this context
+    create proxied sockets.
     """
     if not proxy or not proxy.enabled:
         yield
         return
     try:
-        import socks  # PySocks
+        import socks  # noqa: F401
     except ImportError as e:
         raise RuntimeError("PySocks is required for proxy support; pip install PySocks") from e
 
-    type_map = {
-        "socks5": socks.SOCKS5,
-        "socks4": socks.SOCKS4,
-        "http": socks.HTTP,
-    }
-    if proxy.proxy_type not in type_map:
+    if proxy.proxy_type not in ("socks5", "socks4", "http"):
         raise ValueError(f"unsupported proxy_type: {proxy.proxy_type}")
 
-    with _proxy_socket_lock:
-        prev_socket = socket.socket
-        try:
-            socks.set_default_proxy(
-                type_map[proxy.proxy_type],
-                proxy.host,
-                int(proxy.port),
-                True,  # rdns
-                proxy.username or None,
-                proxy.password or None,
-            )
-            socket.socket = socks.socksocket  # type: ignore
-            yield
-        finally:
-            socket.socket = prev_socket
-            try:
-                socks.set_default_proxy()
-            except Exception:
-                pass
+    _ensure_thread_local_socket_patch()
+    prev = getattr(_tls, "proxy", None)
+    _tls.proxy = proxy
+    try:
+        yield
+    finally:
+        _tls.proxy = prev
 
 
 def create_proxied_connection(
