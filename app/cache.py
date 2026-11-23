@@ -78,14 +78,17 @@ _RESERVED_NAMES = {
 
 
 def normalize_path(path: str) -> str:
-    """Normalize SMB path separators; reject traversal and Windows reserved device names."""
+    """Normalize SMB path separators; reject traversal, wildcards, and reserved names."""
     path = (path or "").replace("\\", "/").strip("/")
     if not path:
         return ""
     parts = [p for p in path.split("/") if p not in ("", ".")]
     for part in parts:
-        if part == ".." or part.startswith(".."):
+        # Exact ".." only — allow names like "..foo" that are valid on some servers
+        if part == "..":
             raise ValueError("path must not contain '..'")
+        if "*" in part or "?" in part:
+            raise ValueError("path must not contain SMB wildcards (* or ?)")
         # reserved device names (CON, PRN, AUX, NUL, COM1.., LPT1..) with optional extension
         stem = part.split(".")[0].upper()
         if stem in _RESERVED_NAMES:

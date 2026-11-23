@@ -54,16 +54,43 @@ _FATAL_SUBSTRINGS = (
     "status_password_expired",
     "status_access_denied",
     "status_object_name_not_found",
+    "status_object_name_collision",
+    "status_object_name_invalid",
     "status_no_such_file",
     "status_object_path_not_found",
+    "status_object_path_invalid",
+    "status_object_path_syntax_bad",
     "status_bad_network_name",
     "status_logon_type_not_granted",
     "status_account_restriction",
+    "status_password_must_change",
+    "status_account_expired",
+    "status_invalid_logon_hours",
+    "status_invalid_workstation",
+    "status_no_such_user",
+    "status_privilege_not_held",
+    "status_media_write_protected",
+    "status_disk_full",
+    "status_insufficient_resources",
+    "status_file_is_a_directory",
+    "status_not_a_directory",
+    "status_directory_not_empty",
+    "status_cannot_delete",
+    "status_file_lock_conflict",
+    "status_lock_not_granted",
+    "status_delete_pending",
+    "status_file_closed",
+    "status_invalid_parameter",
+    "status_invalid_device_request",
+    "status_not_supported",
+    "status_not_implemented",
+    "status_wrong_volume",
     "status_path_not_covered",  # DFS referral required — not a transient network blip
     "not_browsable",
     "invalid_request",
     "authentication failed",
     "dfs_path_not_covered",
+    "cancelled",
 )
 
 
@@ -110,8 +137,12 @@ def classify_error(exc: BaseException) -> str:
     # OSError subclasses without clear message: treat as retriable
     if isinstance(exc, (TimeoutError, ConnectionError, BrokenPipeError, ConnectionResetError, OSError)):
         return "retriable"
-    # Default: retriable for unknown network-ish failures (quality over false fatal)
-    if "status_" in msg or "smb" in msg or "socket" in msg:
+    # Unknown STATUS_* codes must NOT default to hours of retry — treat as fatal
+    # unless they matched the retriable list above.
+    if "status_" in msg:
+        return "fatal"
+    # Ambiguous SMB/socket strings without STATUS_: still retriable (network blips)
+    if "smb" in msg or "socket" in msg:
         return "retriable"
     return "fatal"
 

@@ -18,6 +18,15 @@ def test_normalize_rejects_dotdot():
         normalize_path("foo/../bar")
 
 
+def test_normalize_allows_dotdot_prefixed_names():
+    assert normalize_path("..foo") == "..foo"
+
+
+def test_normalize_rejects_wildcards():
+    with pytest.raises(ValueError):
+        normalize_path("*.txt")
+
+
 def test_normalize_rejects_reserved_names():
     with pytest.raises(ValueError):
         normalize_path("CON")

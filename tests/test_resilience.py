@@ -20,6 +20,8 @@ def test_classify_retriable_vs_fatal():
     assert classify_error(Exception("STATUS_ACCESS_DENIED")) == "fatal"
     assert classify_error(Exception("STATUS_OBJECT_NAME_NOT_FOUND")) == "fatal"
     assert classify_error(Exception("STATUS_PATH_NOT_COVERED")) == "fatal"
+    assert classify_error(Exception("STATUS_DISK_FULL")) == "fatal"
+    assert classify_error(Exception("STATUS_TOTALLY_UNKNOWN_XYZ")) == "fatal"
     assert is_retriable(BrokenPipeError("broken pipe"))
     assert is_connection_dead_error(Exception("connection reset"))
 
