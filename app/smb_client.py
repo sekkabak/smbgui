@@ -230,25 +230,53 @@ class SMBPool:
             logger.debug("setTimeout failed: %s", e)
 
     def _keepalive(self, session: PooledSession) -> None:
-        """Cheap live check: SMB2/3 echo when available, else list IPC$."""
-        server = session.conn.getSMBServer()
-        if hasattr(server, "echo"):
-            server.echo()
-        else:
-            # SMB1 fallback — forces a wire round-trip via tree connect to IPC$
-            try:
-                tid = session.conn.connectTree("IPC$")
-                session.conn.disconnectTree(tid)
-            except Exception:
-                _ = session.conn.getServerOS()
-        session.last_used = time.time()
+        """Cheap live check: SMB2/3 echo when available, else list IPC$.
+
+        Must not race getFile/putFile on the same connection — take session.lock
+        non-blocking and skip if an op is already in flight.
+        """
+        acquired = session.lock.acquire(blocking=False)
+        if not acquired:
+            return
+        try:
+            server = session.conn.getSMBServer()
+            if hasattr(server, "echo"):
+                server.echo()
+            else:
+                # SMB1 fallback — forces a wire round-trip via tree connect to IPC$
+                try:
+                    tid = session.conn.connectTree("IPC$")
+                    session.conn.disconnectTree(tid)
+                except Exception:
+                    _ = session.conn.getServerOS()
+            session.last_used = time.time()
+        finally:
+            session.lock.release()
 
     def _authenticate(self, conn: SMBConnection, host: str, creds: Credentials) -> None:
         if creds.is_guest:
-            # Guest account (not null session). Fall back to anonymous if Guest denied.
+            # Guest account (not null session). Fall back to anonymous only on
+            # logon/access failures — re-raise network/protocol errors.
             try:
                 conn.login(creds.username or "Guest", creds.password or "", creds.domain or "")
-            except Exception:
+            except Exception as e:
+                msg = f"{e}".upper()
+                logonish = any(
+                    s in msg
+                    for s in (
+                        "STATUS_LOGON_FAILURE",
+                        "STATUS_WRONG_PASSWORD",
+                        "STATUS_ACCOUNT",
+                        "STATUS_ACCESS_DENIED",
+                        "STATUS_LOGON_TYPE_NOT_GRANTED",
+                        "STATUS_NO_SUCH_USER",
+                        "STATUS_USER_EXISTS",  # some servers
+                        "AUTHENTICATION",
+                        "LOGON_FAILURE",
+                    )
+                )
+                if not logonish:
+                    raise
                 conn.login("", "")
             return
         if creds.use_kerberos:
@@ -258,6 +286,9 @@ class SMBPool:
                     if creds.ccache:
                         os.environ["KRB5CCNAME"] = creds.ccache
                     kdc = creds.kdc_host or creds.dc_ip or None
+                    # Only use ticket cache when we have an explicit ccache (or
+                    # env already set outside). Always-True can pick a wrong TGT.
+                    use_cache = bool(creds.ccache) or bool(os.environ.get("KRB5CCNAME"))
                     conn.kerberosLogin(
                         creds.username,
                         creds.password or "",
@@ -266,7 +297,7 @@ class SMBPool:
                         nthash=creds.nthash or "",
                         aesKey=creds.aes_key or "",
                         kdcHost=kdc,
-                        useCache=True,
+                        useCache=use_cache,
                     )
                 finally:
                     if creds.ccache:
@@ -555,6 +586,9 @@ def iter_file(
     Holds session.lock for the duration of the transfer (Impacket getFile is
     single-connection / callback-driven). Prefer background jobs for multi-hour
     downloads so the HTTP layer does not block.
+
+    On client abort (GeneratorExit), set a cancel flag so the worker stops
+    blocking on the bounded queue and releases session.lock in ``finally``.
     """
     import queue as queue_mod
 
@@ -563,32 +597,69 @@ def iter_file(
     done_flag = object()
     err_box: list[BaseException] = []
     total = [0]
+    aborted = threading.Event()
 
     def callback(data: bytes):
+        if aborted.is_set():
+            raise SMBError("download aborted by client", code="cancelled")
         total[0] += len(data)
         if progress:
             progress(total[0], -1)
-        q.put(data)
+        # Drop-on-abort / timeout so a cancelled consumer cannot wedge the pool forever
+        while True:
+            if aborted.is_set():
+                raise SMBError("download aborted by client", code="cancelled")
+            try:
+                q.put(data, timeout=0.5)
+                return
+            except queue_mod.Full:
+                continue
 
     def worker():
         try:
-            with session.lock:
+            session.lock.acquire()
+            try:
+                if aborted.is_set():
+                    return
                 session.conn.getFile(share, smb_path, callback)
-            q.put(done_flag)
+            finally:
+                session.lock.release()
         except BaseException as e:
-            err_box.append(e)
-            q.put(done_flag)
+            if not aborted.is_set():
+                err_box.append(e)
+        finally:
+            try:
+                q.put(done_flag, timeout=1)
+            except Exception:
+                pass
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
-    while True:
-        item = q.get()
-        if item is done_flag:
-            break
-        yield item
-    t.join(timeout=1)
-    if err_box:
+    try:
+        while True:
+            item = q.get()
+            if item is done_flag:
+                break
+            yield item
+    except GeneratorExit:
+        aborted.set()
+        # Drain so a blocked put can complete and the worker can exit
+        try:
+            while True:
+                q.get_nowait()
+        except Exception:
+            pass
+        raise
+    finally:
+        aborted.set()
+        t.join(timeout=5)
+    if err_box and not aborted.is_set():
         _raise_smb("getFile", err_box[0])
+    if err_box and aborted.is_set():
+        # Swallow cancel-induced errors after abort
+        code = getattr(err_box[0], "code", "")
+        if code != "cancelled" and "abort" not in str(err_box[0]).lower():
+            pass
 
 
 def download_resumable(
@@ -666,6 +737,17 @@ def query_remote_size(session: PooledSession, share: str, path: str) -> int:
         try:
             files = session.conn.listPath(share, smb_path)
         except Exception as e:
+            msg = f"{e}".upper()
+            if any(
+                s in msg
+                for s in (
+                    "OBJECT_NAME_NOT_FOUND",
+                    "NO_SUCH_FILE",
+                    "OBJECT_PATH_NOT_FOUND",
+                    "STATUS_NO_SUCH_FILE",
+                )
+            ):
+                raise SMBError(f"remote path not found: {share}/{path_n}", code="not_found") from e
             _raise_smb("query_remote_size", e)
     if not files:
         raise SMBError(f"remote path not found: {share}/{path_n}", code="not_found")
@@ -749,15 +831,25 @@ def upload_resumable(
                 offset = remote_sz
             elif remote_sz >= size:
                 # Already complete — still ensure EOF matches
-                try:
-                    set_remote_eof(session, share, path, size)
-                except Exception as e:
-                    logger.debug("set_remote_eof on complete file: %s", e)
+                set_remote_eof(session, share, path, size)
                 if progress:
                     progress(size, size)
                 return size
-        except SMBError:
-            offset = 0
+        except SMBError as e:
+            # Only treat not-found as start-fresh. Transient/network/ACCESS_DENIED
+            # must NOT force FILE_OVERWRITE_IF from offset 0.
+            msg = f"{e.message} {e}".upper()
+            not_found = (
+                e.code == "not_found"
+                or "OBJECT_NAME_NOT_FOUND" in msg
+                or "NO_SUCH_FILE" in msg
+                or "OBJECT_PATH_NOT_FOUND" in msg
+                or "STATUS_OBJECT_NAME_NOT_FOUND" in msg
+            )
+            if not_found:
+                offset = 0
+            else:
+                raise
 
     if offset > size:
         offset = 0
@@ -783,11 +875,8 @@ def upload_resumable(
             except Exception as e:
                 _raise_smb(f"putFile@offset={offset}", e)
 
-    try:
-        set_remote_eof(session, share, path, size)
-    except Exception as e:
-        # Some servers/dialects reject EOF set; data was written — log and continue
-        logger.warning("set_remote_eof after upload failed: %s", e)
+    # Fail the upload if EOF cannot be set — otherwise remote size may be wrong
+    set_remote_eof(session, share, path, size)
     return size
 
 

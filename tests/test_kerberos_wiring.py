@@ -33,7 +33,8 @@ def test_kerberos_login_tcp_to_file_server_not_dc():
         assert _args[2] == "CORP"
         assert kw.get("aesKey") == "a" * 32
         assert kw.get("kdcHost") == "dc.corp.local"
-        assert kw.get("useCache") is True
+        # No ccache / KRB5CCNAME → do not blindly useCache (wrong ticket risk)
+        assert kw.get("useCache") is False
         assert session.creds.use_kerberos is True
 
 
