@@ -11,6 +11,11 @@ from app.smb_client import PooledSession, ShareInfo
 from app.web_sessions import store as web_sessions
 
 
+def _client() -> TestClient:
+    # raise_server_exceptions=False keeps ASGI errors in responses; no real network.
+    return TestClient(app, raise_server_exceptions=False)
+
+
 def _connect(client: TestClient, host="h.example", username="u", password="secret", **extra):
     creds = credentials_from_fields(username=username, password=password)
     mock_conn = MagicMock()
@@ -30,7 +35,7 @@ def _connect(client: TestClient, host="h.example", username="u", password="secre
 
 
 def test_connect_sets_cookie_and_list_works_without_password():
-    client = TestClient(app)
+    client = _client()
     r, session, _ = _connect(client)
     assert r.json()["sid"]
     assert "smbgui_sid" in r.cookies
@@ -48,7 +53,7 @@ def test_connect_sets_cookie_and_list_works_without_password():
 
 
 def test_cookie_only_mkdir_uses_stored_creds_not_empty_username():
-    client = TestClient(app)
+    client = _client()
     r, session, creds = _connect(client)
     assert r.cookies.get("smbgui_sid")
 
@@ -73,7 +78,7 @@ def test_cookie_only_mkdir_uses_stored_creds_not_empty_username():
 
 
 def test_cookie_only_delete_uses_stored_creds():
-    client = TestClient(app)
+    client = _client()
     r, session, _ = _connect(client)
     seen = {}
 
@@ -98,7 +103,7 @@ def test_cookie_only_delete_uses_stored_creds():
 
 
 def test_connect_with_proxy_passed_to_subsequent_list():
-    client = TestClient(app)
+    client = _client()
     proxy_fields = {
         "proxy_type": "socks5",
         "proxy_host": "127.0.0.1",
@@ -123,7 +128,7 @@ def test_connect_with_proxy_passed_to_subsequent_list():
 
 
 def test_get_for_host_miss_does_not_use_empty_creds():
-    client = TestClient(app)
+    client = _client()
     r, session, _ = _connect(client, host="host-a")
     sid = r.json()["sid"]
     # Cookie is for host-a; request host-b with that sid → must not invent empty user
@@ -137,7 +142,7 @@ def test_get_for_host_miss_does_not_use_empty_creds():
 
 
 def test_session_endpoint_omits_raw_sid():
-    client = TestClient(app)
+    client = _client()
     _connect(client)
     r = client.get("/api/session", params={"host": "h.example"})
     assert r.status_code == 200
@@ -145,7 +150,7 @@ def test_session_endpoint_omits_raw_sid():
 
 
 def test_logout_revokes_session():
-    client = TestClient(app)
+    client = _client()
     r, session, _ = _connect(client)
     sid = r.json()["sid"]
     assert web_sessions.get(sid) is not None
@@ -156,7 +161,7 @@ def test_logout_revokes_session():
 
 
 def test_file_cross_site_blocked():
-    client = TestClient(app)
+    client = _client()
     r, session, _ = _connect(client)
     with patch("app.main.pool.get", return_value=session):
         r2 = client.get(
@@ -168,7 +173,7 @@ def test_file_cross_site_blocked():
 
 
 def test_samesite_strict_cookie():
-    client = TestClient(app)
+    client = _client()
     r, _, _ = _connect(client)
     # Starlette TestClient exposes set-cookie; check raw header
     set_cookie = r.headers.get("set-cookie", "")
