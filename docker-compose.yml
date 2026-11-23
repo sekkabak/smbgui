@@ -1,0 +1,20 @@
+# smbgui — publish ONLY to 127.0.0.1 (no auth; credentials held in memory).
+services:
+  smbgui:
+    build: .
+    image: smbgui:1.2
+    container_name: smbgui
+    ports:
+      # Bind host side to loopback only — do NOT use 0.0.0.0:8787:8787
+      - "127.0.0.1:8787:8787"
+    environment:
+      SMBGUI_DATA_DIR: /app/data
+      SMBGUI_HOST: "0.0.0.0"
+      SMBGUI_PORT: "8787"
+    volumes:
+      # Persistent cache DBs + bookmarks.json
+      - smbgui-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  smbgui-data:

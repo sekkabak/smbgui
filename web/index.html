@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>smbgui</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>smbgui</h1>
+    <select id="hostSwitcher" title="Active session"></select>
+    <form id="connForm" class="conn-form" autocomplete="off">
+      <input id="connStr" placeholder="DOMAIN\user:pass@host[:port]" size="32" />
+      <input id="hash" placeholder="NT / LM:NT (PTH)" size="22" />
+      <label class="chk"><input type="checkbox" id="guest" /> guest</label>
+      <label class="chk"><input type="checkbox" id="useKerb" /> Kerberos</label>
+      <button type="button" id="btnKerbMore" class="ghost" title="Kerberos options">⚙ Kerb</button>
+      <button type="button" id="btnRelMore" class="ghost" title="Reliability / proxy">⚙ Reliability</button>
+      <button type="submit" class="primary">Connect</button>
+    </form>
+    <div class="spacer"></div>
+    <input id="searchQ" class="search-box" placeholder="FTS search…" />
+    <button type="button" id="btnSearch">Search</button>
+  </header>
+
+  
+  <div id="reliabilityPanel" class="kerb-panel hidden">
+    <label>connect_timeout(s) <input id="relConnectTimeout" type="number" value="3600" style="width:90px" title="0=unlimited" /></label>
+    <label>io_timeout(s) <input id="relIoTimeout" type="number" value="0" style="width:90px" title="0=unlimited/hours" /></label>
+    <label>max_retries <input id="relMaxRetries" type="number" value="10" style="width:70px" /></label>
+    <label>base_delay <input id="relBaseDelay" type="number" step="0.1" value="2" style="width:70px" /></label>
+    <label>max_delay <input id="relMaxDelay" type="number" value="600" style="width:80px" /></label>
+    <label class="chk"><input type="checkbox" id="relRetry" checked /> retry</label>
+    <label class="chk"><input type="checkbox" id="relReconnect" checked /> auto-reconnect</label>
+    <label class="chk"><input type="checkbox" id="relResume" checked /> resume</label>
+    <select id="proxyType">
+      <option value="socks5">SOCKS5</option>
+      <option value="socks4">SOCKS4</option>
+      <option value="http">HTTP CONNECT</option>
+    </select>
+    <input id="proxyHost" placeholder="proxy host" size="14" />
+    <input id="proxyPort" placeholder="port" size="6" />
+    <input id="proxyUser" placeholder="proxy user" size="10" />
+    <input id="proxyPass" placeholder="proxy pass" type="password" size="10" />
+    <button type="button" id="btnSaveRel" class="primary">Save reliability</button>
+    <button type="button" id="btnJobs">Jobs</button>
+  </div>
+  <div id="jobsPanel" class="kerb-panel hidden">
+    <pre id="jobsList" class="meta" style="max-height:120px;overflow:auto;width:100%"></pre>
+  </div>
+
+  <div id="kerbPanel" class="kerb-panel hidden">
+    <input id="aesKey" placeholder="AES key (32/64 hex)" size="40" />
+    <input id="kdcHost" placeholder="KDC host" size="18" />
+    <input id="dcIp" placeholder="DC IP" size="14" />
+    <input id="ccache" placeholder="ccache path (or KRB5CCNAME)" size="28" />
+  </div>
+
+  <div class="layout">
+    <aside class="panel left">
+      <h2>Bookmarks</h2>
+      <div class="body" id="bookmarks"></div>
+      <h2>Recent</h2>
+      <div class="body" id="recent"></div>
+      <h2>Shares</h2>
+      <div class="body" id="shares"></div>
+    </aside>
+
+    <main class="panel center">
+      <div class="toolbar">
+        <input id="addressBar" class="address" placeholder="\\host\share\path" />
+        <button type="button" id="btnGo">Go</button>
+        <button type="button" id="btnRefresh" class="warn" title="Refresh (F5)">↻</button>
+        <button type="button" id="btnRefreshRec" class="warn" title="Recursive refresh">↻↻</button>
+        <button type="button" id="btnRefreshAll" class="warn" title="Refresh all shares">All</button>
+        <span class="meta" id="listMeta"></span>
+        <span id="badges"></span>
+        <div class="spacer"></div>
+        <button type="button" id="btnUpload">Upload</button>
+        <button type="button" id="btnMkdir">Mkdir</button>
+        <button type="button" id="btnRename">Rename</button>
+        <button type="button" id="btnCopy">Copy</button>
+        <button type="button" id="btnMove">Move</button>
+        <button type="button" id="btnDelete" class="danger">Delete</button>
+        <button type="button" id="btnDownload">Download</button>
+        <button type="button" id="btnZip">Zip folder</button>
+        <button type="button" id="btnProps">Props</button>
+        <button type="button" id="btnBookmark">★</button>
+        <select id="exportFmt" title="Export format">
+          <option value="csv">CSV</option>
+          <option value="json">JSON</option>
+        </select>
+        <button type="button" id="btnExport" title="Export folder listing">Export</button>
+        <label class="chk" title="Show hidden/admin $-shares"><input type="checkbox" id="showHidden" checked /> admin$</label>
+        <input type="file" id="fileInput" class="hidden" multiple />
+      </div>
+      <div class="progress-wrap hidden" id="progressWrap">
+        <div class="progress-bar"><div id="progressFill"></div></div>
+        <span id="progressLabel" class="meta"></span>
+      </div>
+      <div class="filter-row">
+        <input id="filterBox" placeholder="Filter columns…" />
+        <select id="sortCol">
+          <option value="name">Sort: name</option>
+          <option value="size">Sort: size</option>
+          <option value="mtime">Sort: modified</option>
+        </select>
+        <button type="button" id="btnSortDir" title="Toggle asc/desc">↕</button>
+      </div>
+      <div class="body dropzone" id="dropzone">
+        <table class="files">
+          <thead>
+            <tr>
+              <th><input type="checkbox" id="selectAll" /></th>
+              <th data-col="name">Name</th>
+              <th data-col="size">Size</th>
+              <th data-col="mtime">Modified</th>
+              <th data-col="attrs">Attr</th>
+            </tr>
+          </thead>
+          <tbody id="files"></tbody>
+        </table>
+        <div id="searchResults" class="hidden"></div>
+      </div>
+    </main>
+
+    <aside class="panel right">
+      <h2>Preview / Properties</h2>
+      <div class="body preview" id="preview"><span class="meta">Select a file</span></div>
+      <h2>Wire / cache log</h2>
+      <div class="body log" id="log"></div>
+      <h2>Cache</h2>
+      <div class="body cache-tools">
+        <button type="button" id="btnCacheStatus">Status</button>
+        <button type="button" id="btnCacheExport">Export</button>
+        <label class="btn-file">Import<input type="file" id="cacheImport" class="hidden" accept=".zip" /></label>
+        <button type="button" id="btnCacheClear" class="danger">Clear host</button>
+        <label>TTL <input id="ttlInput" type="number" min="1" value="300" style="width:70px" /></label>
+        <button type="button" id="btnTtl">Set</button>
+        <pre id="cacheStatus" class="meta"></pre>
+      </div>
+    </aside>
+  </div>
+
+  <div class="operator-status" id="operatorStatus" data-severity="info" data-busy="0" title="Live operator activity">
+    <span class="op-spinner" id="opSpinner" aria-hidden="true"></span>
+    <span class="op-state" id="opState">idle</span>
+    <span class="op-msg" id="opMsg">idle</span>
+    <span class="op-progress hidden" id="opProgressWrap"><span class="op-progress-bar"><span id="opProgressFill"></span></span><span id="opProgressPct"></span></span>
+    <span class="op-host" id="opHost"></span>
+    <span class="spacer"></span>
+    <span class="op-updated meta" id="opUpdated">—</span>
+  </div>
+  <div class="status">
+    <span id="statusLeft">idle</span>
+    <span id="statusRight"></span>
+  </div>
+
+  <div class="modal-bg" id="modal">
+    <div class="modal">
+      <h3 id="modalTitle">Input</h3>
+      <input id="modalInput" style="width:100%" />
+      <div class="row">
+        <button type="button" id="modalCancel">Cancel</button>
+        <button type="button" id="modalOk" class="primary">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

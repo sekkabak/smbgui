@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+.DS_Store
+
+# Secrets & local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials.json
+*.ccache
+krb5cc*
+krb5.conf.local
+
+# Runtime / cache data
+data/*.db
+data/*.db-*
+data/bookmarks.json
+data/*.zip
+data/parts/
+data/sessions/
+*.part
+*.offset
+
+# Captured traffic / dumps
+*.pcap
+*.pcapng
+*.har
+*.cap
+
+# IDE / agent
+.idea/
+.vscode/
+*.swp
+.cursor/
+agent-transcripts/
+graphify-out/
+
+# OS
+Thumbs.db
+Desktop.ini
